@@ -1,0 +1,18 @@
+[package]
+name = "synchrotron"
+version = "0.1.0"
+authors = ["Phil Ruffwind <rf@rufflewind.com>"]
+description = "A single-threaded busy-wait executor based on futures"
+documentation = "https://docs.rs/synchrotron"
+repository = "https://github.com/Rufflewind/synchrotron"
+readme = "README.md"
+keywords = ["executor", "futures", "single-thread"]
+categories = ["concurrency"]
+license = "MIT/Apache-2.0"
+exclude = [".gitignore"]
+
+[dependencies]
+futures = "0.1.11"
+index_queue = "0.1.0"
+vec-arena = "0.1.1"
+void = "1.0.2"
