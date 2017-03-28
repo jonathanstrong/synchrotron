@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["Arena","An object arena."],["IntoIter","An iterator over the occupied slots in a `Arena`."],["Iter","An iterator over references to the occupied slots in a `Arena`."],["IterMut","An iterator over mutable references to the occupied slots in a `Arena`."]]});

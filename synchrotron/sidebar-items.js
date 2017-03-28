@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["Core","The task executor."],["Handle","A cloneable handle to a `Core`."],["RunFuture","A combined `Core` and future `F` that can be run."]]});
