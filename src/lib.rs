@@ -8,15 +8,12 @@ extern crate index_queue;
 extern crate vec_arena;
 extern crate void;
 
-#[cfg(test)]
-mod tests;
-
 use std::fmt;
 use std::cell::RefCell;
 use std::rc::{self, Rc};
 use std::sync::{Arc, Mutex};
-use futures::executor::{Spawn, Unpark};
-use futures::{Async, Future};
+use futures::executor::{self, Spawn, Unpark};
+use futures::{Async, Future, Poll, future, task};
 use index_queue::IndexQueue;
 use vec_arena::Arena;
 use void::Void;
@@ -103,12 +100,12 @@ impl Unpark for Ticket {
     }
 }
 
-struct Spawned<'a> {
-    spawn: Spawn<Box<Future<Item=(), Error=Void> + 'a>>,
+struct Spawned<F> {
+    spawn: Spawn<F>,
     ticket: Arc<Ticket>,
 }
 
-impl<'a> fmt::Debug for Spawned<'a> {
+impl<F> fmt::Debug for Spawned<F> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_tuple("Spawned")
             .field(&self.ticket)
@@ -118,7 +115,7 @@ impl<'a> fmt::Debug for Spawned<'a> {
 
 #[derive(Default)]
 struct Inner<'a> {
-    spawns: Arena<Option<Spawned<'a>>>,
+    spawns: Arena<Option<Spawned<Box<Future<Item=(), Error=Void> + 'a>>>>,
     queue: Arc<Mutex<IndexQueue>>,
 }
 
@@ -154,7 +151,7 @@ impl<'a> fmt::Debug for Inner<'a> {
 pub struct Handle<'a>(rc::Weak<RefCell<Inner<'a>>>);
 
 impl<'a> Handle<'a> {
-    /// Spawn a new task into this future.  The spawned tasks are executed
+    /// Spawn a new task into the executor.  The spawned tasks are executed
     /// when [`run`](struct.Core.html#method.run) is called.
     pub fn spawn<F: Future<Item=(), Error=Void> + 'a>(&self, f: F) {
         let inner = match self.0.upgrade() {
@@ -165,9 +162,39 @@ impl<'a> Handle<'a> {
         let aux = inner.spawns.insert(None);
         let ticket = inner.new_ticket(SpawnId::aux(aux));
         inner.spawns[aux] = Some(Spawned {
-            spawn: futures::executor::spawn(Box::new(f)),
+            spawn: executor::spawn(Box::new(f) as Box<_>),
             ticket: ticket,
         });
+    }
+}
+
+fn yield_if_not_ready<T, E>(status: Option<Poll<T, E>>) -> Poll<T, E> {
+    let result = status.unwrap_or(Ok(Async::NotReady));
+    if let Ok(Async::NotReady) = result {
+        task::park().unpark();
+    }
+    result
+}
+
+#[derive(Debug)]
+pub struct RunFuture<'b, 'a: 'b, F> {
+    core: &'b mut Core<'a>,
+    spawned: Spawned<F>,
+}
+
+impl<'b, 'a, F: Future> RunFuture<'b, 'a, F> {
+    /// Perform one iteration of the executor loop.  Returns `None` if all
+    /// tasks are parked (no apparent progress was made).
+    pub fn turn(&mut self) -> Option<Poll<F::Item, F::Error>> {
+        self.core.turn_with(Ok(&mut self.spawned))
+    }
+}
+
+impl<'b, 'a, F: Future> Future for RunFuture<'b, 'a, F> {
+    type Item = F::Item;
+    type Error = F::Error;
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        yield_if_not_ready(self.turn())
     }
 }
 
@@ -185,45 +212,103 @@ impl<'a> Core<'a> {
     /// Run the given future on the current thread until completion.  Spawned
     /// tasks are run concurrently as well, but may or may not complete.
     pub fn run<F: Future>(&mut self, f: F) -> Result<F::Item, F::Error> {
-        let mut main_spawn = futures::executor::spawn(f);
-        let main_ticket = self.0.borrow().new_ticket(SpawnId::main());
+        let mut run = self.run_future(f);
         loop {
-            let index = match {
-                let inner = self.0.borrow();
-                let popped = inner.queue.lock().unwrap().pop_front();
-                popped
-            } {
-                None => continue,
-                Some(index) => index,
-            };
-            match SpawnId::from_queue_index(index).to_aux() {
-                None => {
-                    let ticket = main_ticket.clone();
-                    let status = main_spawn.poll_future(ticket)?;
-                    if let Async::Ready(x) = status {
-                        main_ticket.deactivate();
-                        return Ok(x);
+            match run.turn().unwrap_or(Ok(Async::NotReady))? {
+                Async::Ready(x) => return Ok(x),
+                Async::NotReady => continue,
+            }
+        }
+    }
+
+    /// Like `run`, but creates a `Future` object, allowing the user to
+    /// manually [`turn`](struct.RunFuture.html#method.turn) the executor.
+    pub fn run_future<'b, F: Future>(&'b mut self, f: F)
+                                     -> RunFuture<'b, 'a, F> {
+        let ticket = {
+            let inner = self.0.borrow();
+            // if the main spawn is still queued somehow (because the user did
+            // not complete a previous RunFuture), remove it
+            let id = SpawnId::main();
+            inner.queue.lock().unwrap().remove(id.to_queue_index());
+            inner.new_ticket(id)
+        };
+        RunFuture {
+            core: self,
+            spawned: Spawned {
+                spawn: executor::spawn(f),
+                ticket: ticket,
+            },
+        }
+    }
+
+    /// Perform one iteration of the executor loop.  Returns `None` if all
+    /// tasks are parked (no apparent progress was made).  Returns
+    /// `Some(Ok(Ready(())))` if all spawned tasks have completed.
+    pub fn turn(&mut self) -> Option<Poll<(), Void>> {
+        self.turn_with::<future::Empty<(), Void>>(Err(()))
+    }
+
+    /// Perform one iteration of the executor loop, optionally with a given
+    /// main spawn.  Returns `None` if all tasks are parked (no apparent
+    /// progress could be made).
+    fn turn_with<F: Future>(&mut self, main: Result<&mut Spawned<F>, F::Item>)
+                            -> Option<Poll<F::Item, F::Error>> {
+        let index = {
+            let inner = self.0.borrow();
+            let popped = inner.queue.lock().unwrap().pop_front();
+            match popped {
+                None => return if inner.spawns.is_empty() {
+                    match main {
+                        Err(item) => Some(Ok(Async::Ready(item))),
+                        Ok(_) => None
                     }
-                }
-                Some(aux) => {
-                    let spawned = self.0.borrow_mut().spawns.get_mut(aux)
-                        .and_then(|x| x.take());
-                    if let Some(mut spawned) = spawned {
-                        let ticket = spawned.ticket.clone();
-                        let status = spawned.spawn.poll_future(ticket)
-                            .map_err(|void| match void {})?;
-                        let mut inner = self.0.borrow_mut();
-                        if let Async::Ready(()) = status {
-                            spawned.ticket.deactivate();
-                            inner.spawns.remove(aux);
-                        } else {
-                            inner.spawns[aux] = Some(spawned);
+                } else {
+                    None
+                },
+                Some(index) => index,
+            }
+        };
+        match SpawnId::from_queue_index(index).to_aux() {
+            None => {
+                match main {
+                    Err(_) => Some(Ok(Async::NotReady)),
+                    Ok(main) => {
+                        let ticket = main.ticket.clone();
+                        let poll = main.spawn.poll_future(ticket);
+                        if let Ok(Async::Ready(_)) = poll {
+                            main.ticket.deactivate();
                         }
-                    } else {
-                        self.0.borrow_mut().spawns.remove(aux);
+                        Some(poll)
                     }
                 }
             }
+            Some(aux) => {
+                let spawned = self.0.borrow_mut().spawns.get_mut(aux)
+                    .and_then(|x| x.take());
+                if let Some(mut spawned) = spawned {
+                    let ticket = spawned.ticket.clone();
+                    let poll = spawned.spawn.poll_future(ticket);
+                    let mut inner = self.0.borrow_mut();
+                    if let Ok(Async::Ready(())) = poll {
+                        spawned.ticket.deactivate();
+                        inner.spawns.remove(aux);
+                    } else {
+                        inner.spawns[aux] = Some(spawned);
+                    }
+                } else {
+                    self.0.borrow_mut().spawns.remove(aux);
+                }
+                Some(Ok(Async::NotReady))
+            }
         }
+    }
+}
+
+impl<'a> Future for Core<'a> {
+    type Item = ();
+    type Error = Void;
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        yield_if_not_ready(self.turn())
     }
 }

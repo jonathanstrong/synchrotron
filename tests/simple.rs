@@ -1,9 +1,12 @@
+extern crate futures;
+extern crate synchrotron;
+extern crate void;
+
 use std::{thread, time};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use futures::{future, task, Async, BoxFuture, Future};
-use void::Void;
-use super::Core;
+use void::{ResultVoidExt, Void};
 
 #[derive(Default)]
 struct Inbox {
@@ -45,16 +48,16 @@ fn receive(inbox: &Arc<Mutex<Inbox>>) -> BoxFuture<&'static str, Void> {
 }
 
 #[test]
-fn it_works() {
+fn main() {
     let ref main_inbox = Default::default();
     let ref aux_inbox = Default::default();
-    let mut core = Core::default();
+    let mut core = synchrotron::Core::default();
     let handle = core.handle();
     handle.spawn({
         receive(aux_inbox).and_then(|message| {
             assert_eq!(message, "hello");
             send(main_inbox, "hi")
-        }).and_then(move |()| {
+        }).and_then(|()| {
             receive(aux_inbox)
         }).and_then(|message| {
             assert_eq!(message, "goodbye");
@@ -72,5 +75,5 @@ fn it_works() {
         }).map(|message| {
             assert_eq!(message, "bye");
         })
-    }).unwrap()
+    }).void_unwrap()
 }
