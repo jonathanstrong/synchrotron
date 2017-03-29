@@ -4,9 +4,16 @@
 //! done.
 
 extern crate futures;
+#[cfg(feature = "futures-spawn")]
+extern crate futures_spawn;
 extern crate index_queue;
 extern crate vec_arena;
 extern crate void;
+
+pub mod drop_off;
+mod spawn_future;
+
+pub use spawn_future::SpawnFuture;
 
 use std::fmt;
 use std::cell::RefCell;
@@ -168,6 +175,21 @@ impl<'a> Handle<'a> {
             ticket: ticket,
         });
     }
+
+    /// Spawn a future as its own task and then return a future that can be
+    /// used to query its result.
+    pub fn spawn_future<F: Future>(&self, future: F) -> SpawnFuture<'a, F> {
+        SpawnFuture::new(self.clone(), future)
+    }
+}
+
+#[cfg(feature = "futures-spawn")]
+impl<'a, F> futures_spawn::Spawn<F> for Handle<'a>
+    where F: Future<Item=(), Error=()> + 'a
+{
+    fn spawn_detached(&self, f: F) {
+        self.spawn(f.or_else(|_| Ok(())))
+    }
 }
 
 /// Unpark the current task if the `status` is `Some(Ok(NotReady))` or `None`.
@@ -181,6 +203,7 @@ fn yield_turn<T, E>(status: Option<Poll<T, E>>) -> Poll<T, E> {
 
 /// A combined `Core` and future `F` that can be run.
 #[derive(Debug)]
+#[must_use = "futures do nothing unless polled"]
 pub struct RunFuture<'b, 'a: 'b, F> {
     core: &'b mut Core<'a>,
     spawned: Spawned<F>,
@@ -257,8 +280,8 @@ impl<'a> Core<'a> {
     /// Perform one iteration of the executor loop.  Returns `None` if all
     /// tasks are parked (no apparent progress was made).  Returns
     /// `Some(Ok(Ready(())))` if all spawned tasks have completed.
-    pub fn turn(&mut self) -> Option<Poll<(), Void>> {
-        self.turn_with::<future::Empty<(), Void>>(Err(()))
+    pub fn turn<T>(&mut self) -> Option<Poll<(), T>> {
+        self.turn_with::<future::Empty<(), T>>(Err(()))
     }
 
     /// Perform one iteration of the executor loop, optionally with a given
@@ -323,5 +346,14 @@ impl<'a> Future for Core<'a> {
     type Error = Void;
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         yield_turn(self.turn())
+    }
+}
+
+#[cfg(feature = "futures-spawn")]
+impl<'a, F> futures_spawn::Spawn<F> for Core<'a>
+    where F: Future<Item=(), Error=()> + 'a
+{
+    fn spawn_detached(&self, f: F) {
+        self.handle().spawn_detached(f)
     }
 }
