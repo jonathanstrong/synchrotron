@@ -4,7 +4,6 @@ extern crate synchrotron;
 extern crate test;
 extern crate tokio_core;
 
-use std::time::Instant;
 use futures::{Async, Poll, future, task};
 
 #[bench]

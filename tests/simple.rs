@@ -49,8 +49,8 @@ fn receive(inbox: &Arc<Mutex<Inbox>>) -> BoxFuture<&'static str, Void> {
 
 #[test]
 fn main() {
-    let ref main_inbox = Default::default();
-    let ref aux_inbox = Default::default();
+    let main_inbox = &Default::default();
+    let aux_inbox = &Default::default();
     let mut core = synchrotron::Core::default();
     let handle = core.handle();
     handle.spawn({

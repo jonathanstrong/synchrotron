@@ -32,7 +32,7 @@ struct SpawnId(usize);
 
 impl SpawnId {
     fn from_queue_index(queue_index: usize) -> Self {
-        debug_assert!(queue_index != !0);
+        debug_assert_ne!(queue_index, !0);
         SpawnId(queue_index)
     }
 
@@ -113,9 +113,11 @@ impl<F> fmt::Debug for Spawned<F> {
     }
 }
 
+type SpawnedBox<'a> = Spawned<Box<Future<Item=(), Error=Void> + 'a>>;
+
 #[derive(Default)]
 struct Inner<'a> {
-    spawns: Arena<Option<Spawned<Box<Future<Item=(), Error=Void> + 'a>>>>,
+    spawns: Arena<Option<SpawnedBox<'a>>>,
     queue: Arc<Mutex<IndexQueue>>,
 }
 
@@ -168,7 +170,8 @@ impl<'a> Handle<'a> {
     }
 }
 
-fn yield_if_not_ready<T, E>(status: Option<Poll<T, E>>) -> Poll<T, E> {
+/// Unpark the current task if the `status` is `Some(Ok(NotReady))` or `None`.
+fn yield_turn<T, E>(status: Option<Poll<T, E>>) -> Poll<T, E> {
     let result = status.unwrap_or(Ok(Async::NotReady));
     if let Ok(Async::NotReady) = result {
         task::park().unpark();
@@ -176,6 +179,7 @@ fn yield_if_not_ready<T, E>(status: Option<Poll<T, E>>) -> Poll<T, E> {
     result
 }
 
+/// A combined `Core` and future `F` that can be run.
 #[derive(Debug)]
 pub struct RunFuture<'b, 'a: 'b, F> {
     core: &'b mut Core<'a>,
@@ -183,6 +187,17 @@ pub struct RunFuture<'b, 'a: 'b, F> {
 }
 
 impl<'b, 'a, F: Future> RunFuture<'b, 'a, F> {
+    /// Run the future `F` on the current thread until completion.  Spawned
+    /// tasks are run concurrently as well, but may or may not complete.
+    pub fn run(&mut self) -> Result<F::Item, F::Error> {
+        loop {
+            match self.turn().unwrap_or(Ok(Async::NotReady))? {
+                Async::Ready(x) => return Ok(x),
+                Async::NotReady => continue,
+            }
+        }
+    }
+
     /// Perform one iteration of the executor loop.  Returns `None` if all
     /// tasks are parked (no apparent progress was made).
     pub fn turn(&mut self) -> Option<Poll<F::Item, F::Error>> {
@@ -194,7 +209,7 @@ impl<'b, 'a, F: Future> Future for RunFuture<'b, 'a, F> {
     type Item = F::Item;
     type Error = F::Error;
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        yield_if_not_ready(self.turn())
+        yield_turn(self.turn())
     }
 }
 
@@ -211,17 +226,14 @@ impl<'a> Core<'a> {
 
     /// Run the given future on the current thread until completion.  Spawned
     /// tasks are run concurrently as well, but may or may not complete.
+    ///
+    /// This is equivalent to `self.run_future().run()`.
     pub fn run<F: Future>(&mut self, f: F) -> Result<F::Item, F::Error> {
-        let mut run = self.run_future(f);
-        loop {
-            match run.turn().unwrap_or(Ok(Async::NotReady))? {
-                Async::Ready(x) => return Ok(x),
-                Async::NotReady => continue,
-            }
-        }
+        self.run_future(f).run()
     }
 
-    /// Like `run`, but creates a `Future` object, allowing the user to
+    /// Like [`run`](#method.run), but creates a
+    /// [`RunFuture`](struct.RunFuture.html) object, which allows one to
     /// manually [`turn`](struct.RunFuture.html#method.turn) the executor.
     pub fn run_future<'b, F: Future>(&'b mut self, f: F)
                                      -> RunFuture<'b, 'a, F> {
@@ -251,7 +263,8 @@ impl<'a> Core<'a> {
 
     /// Perform one iteration of the executor loop, optionally with a given
     /// main spawn.  Returns `None` if all tasks are parked (no apparent
-    /// progress could be made).
+    /// progress could be made).  If `main` is set to `Err(e)`, returns
+    /// `Some(Ok(Ready(e)))` if there are no more spawns.
     fn turn_with<F: Future>(&mut self, main: Result<&mut Spawned<F>, F::Item>)
                             -> Option<Poll<F::Item, F::Error>> {
         let index = {
@@ -309,6 +322,6 @@ impl<'a> Future for Core<'a> {
     type Item = ();
     type Error = Void;
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        yield_if_not_ready(self.turn())
+        yield_turn(self.turn())
     }
 }
