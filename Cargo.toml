@@ -7,7 +7,7 @@ documentation = "https://docs.rs/synchrotron"
 repository = "https://github.com/Rufflewind/synchrotron"
 readme = "README.md"
 keywords = ["executor", "futures", "single-thread"]
-categories = ["concurrency"]
+categories = ["asynchronous", "concurrency"]
 license = "MIT/Apache-2.0"
 exclude = [".gitignore"]
 
