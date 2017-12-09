@@ -26,7 +26,7 @@ fn busy_synchrotron_spawn(b: &mut test::Bencher) {
         Ok(Async::NotReady)
     }));
     b.iter(|| {
-        core.turn();
+        core.turn::<()>();
     });
 }
 
